@@ -97,40 +97,20 @@ class VayneClient:
         }
 
     async def update_authentication(self, linkedin_cookie: str) -> Dict[str, Any]:
-        """
-        Update LinkedIn session cookie.
-        Raises exception with descriptive message if cookie is invalid or expired.
-        """
-        # Validate cookie format (basic check)
-        if not linkedin_cookie or len(linkedin_cookie.strip()) < 10:
-            raise Exception("Invalid LinkedIn cookie format - cookie is too short or empty")
-        
+        """Update LinkedIn session cookie."""
         # Vayne API expects: { "session_cookie": "..." }
         # Vayne API returns: { "linkedin_authentication": "active" | "checking", ... }
-        try:
-            response = await self._request(
-                "PATCH",
-                "/api/linkedin_authentication",
-                data={"session_cookie": linkedin_cookie}
-            )
-            
-            # Check if authentication was successful
-            linkedin_auth = response.get("linkedin_authentication", "")
-            if linkedin_auth == "invalid" or linkedin_auth == "expired":
-                raise Exception(f"LinkedIn cookie is {linkedin_auth}. Please get a fresh li_at cookie from LinkedIn.")
-            
-            # Return the cookie that was set
-            return {
-                "linkedin_cookie": linkedin_cookie,  # Return the cookie we sent
-                "linkedin_authentication": linkedin_auth,
-                "message": "LinkedIn authentication updated successfully"
-            }
-        except Exception as e:
-            error_msg = str(e).lower()
-            # Provide more helpful error messages
-            if "401" in error_msg or "unauthorized" in error_msg:
-                raise Exception("LinkedIn cookie is invalid or expired. Please get a fresh li_at cookie from LinkedIn.")
-            raise
+        response = await self._request(
+            "PATCH",
+            "/api/linkedin_authentication",
+            data={"session_cookie": linkedin_cookie}
+        )
+        
+        # Return the cookie that was set
+        return {
+            "linkedin_cookie": linkedin_cookie,  # Return the cookie we sent
+            "message": "LinkedIn authentication updated successfully"
+        }
 
     async def get_credits(self) -> Dict[str, Any]:
         """Get available credits and usage limits."""
@@ -222,76 +202,6 @@ class VayneClient:
             order["id"] = str(order["id"])
         
         return order
-
-    async def check_export_ready(self, order_id: str, export_format: str = "advanced") -> Optional[str]:
-        """
-        Check if export is ready and return the file URL if available.
-        Returns None if export is not ready yet.
-        """
-        try:
-            order_response = await self._request("GET", f"/api/orders/{order_id}")
-            order_data = order_response.get("order", {})
-            exports = order_data.get("exports", {})
-            
-            # Check requested format first
-            requested_export = exports.get(export_format, {})
-            if requested_export.get("status") == "completed" and requested_export.get("file_url"):
-                return requested_export.get("file_url")
-            
-            # Fallback to any available format
-            for fmt in ["advanced", "simple"]:
-                export_info = exports.get(fmt, {})
-                if export_info.get("status") == "completed" and export_info.get("file_url"):
-                    print(f"⚠️ {export_format} not ready, using {fmt} format")
-                    return export_info.get("file_url")
-            
-            return None
-        except Exception as e:
-            print(f"⚠️ Error checking export status: {e}")
-            return None
-
-    async def export_order_with_retry(
-        self,
-        order_id: str,
-        export_format: str = "advanced",
-        max_retries: int = 5,
-        initial_delay: float = 2.0,
-        max_delay: float = 30.0
-    ) -> bytes:
-        """
-        Export order results as CSV with retry logic.
-        Waits for export to be ready with exponential backoff.
-        """
-        delay = initial_delay
-        
-        for attempt in range(max_retries):
-            # First check if export is already available
-            file_url = await self.check_export_ready(order_id, export_format)
-            
-            if file_url:
-                print(f"✅ Export ready on attempt {attempt + 1}, downloading from {file_url[:50]}...")
-                file_response = await self.client.get(file_url)
-                file_response.raise_for_status()
-                return file_response.content
-            
-            # Try to trigger export generation
-            if attempt == 0:
-                print(f"🔄 Triggering export generation for order {order_id}...")
-                try:
-                    await self._request(
-                        "POST",
-                        f"/api/orders/{order_id}/export",
-                        data={"export_format": export_format}
-                    )
-                except Exception as e:
-                    print(f"⚠️ Export trigger failed: {e}")
-            
-            if attempt < max_retries - 1:
-                print(f"⏳ Export not ready, waiting {delay:.1f}s before retry {attempt + 2}/{max_retries}...")
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, max_delay)  # Exponential backoff with max
-        
-        raise Exception(f"Export not available after {max_retries} attempts for order {order_id}")
 
     async def export_order(self, order_id: str, export_format: str = "advanced") -> bytes:
         """Export order results as CSV. Tries requested format first, falls back to available format."""

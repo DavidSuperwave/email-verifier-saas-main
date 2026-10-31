@@ -102,14 +102,3 @@ webhook_router = APIRouter()
 webhook_router.add_api_route("/orders", vayne_webhook, methods=["POST"])
 app.include_router(webhook_router, prefix="/api/webhooks/vayne", tags=["webhooks"])
 
-# Vayne webhook verification endpoint (for testing webhook connectivity)
-# Configure this URL in Vayne dashboard: https://www.billionverifier.io/api/webhooks/vayne/orders
-@app.get("/api/webhooks/vayne/health")
-async def vayne_webhook_health():
-    """Health check endpoint to verify webhook is accessible."""
-    return {
-        "status": "healthy",
-        "webhook_url": f"{settings.WEBHOOK_BASE_URL}/api/webhooks/vayne/orders",
-        "message": "Configure this URL in Vayne dashboard API Settings"
-    }
-

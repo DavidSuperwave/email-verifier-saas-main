@@ -14,17 +14,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import desc
 from typing import Optional
 from uuid import UUID
-from datetime import datetime, timedelta
+from datetime import datetime
 import io
 import csv
 import boto3
-import logging
-
-# Configure logging
-logger = logging.getLogger(__name__)
-
-# Constants for stuck order detection
-STUCK_ORDER_THRESHOLD_HOURS = 24  # Orders older than this with pending/processing status are considered stuck
 
 from app.db.session import get_db
 from app.models.user import User
@@ -176,18 +169,7 @@ async def create_order(
         vayne_client = get_vayne_client()
         
         # Step 1: Update LinkedIn session cookie with Vayne
-        try:
-            cookie_response = await vayne_client.update_authentication(order_data.linkedin_cookie)
-            logger.info(f"LinkedIn authentication updated for user {current_user.id}")
-        except Exception as auth_error:
-            error_msg = str(auth_error).lower()
-            if "401" in error_msg or "unauthorized" in error_msg or "invalid" in error_msg or "expired" in error_msg:
-                logger.warning(f"LinkedIn cookie authentication failed for user {current_user.id}: {auth_error}")
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="LinkedIn session cookie is invalid or expired. Please get a fresh li_at cookie from LinkedIn and try again."
-                )
-            raise
+        cookie_response = await vayne_client.update_authentication(order_data.linkedin_cookie)
         
         # Step 2: Validate the Sales Navigator URL
         url_check = await vayne_client.check_url(order_data.sales_nav_url)
@@ -272,30 +254,22 @@ async def _sync_order_with_vayne(order: VayneOrder, db: Session) -> bool:
         
         # If Vayne says "finished", verify export is available before marking as completed
         if vayne_status == "completed":
-            # Try to verify export is available (use quick check, not full retry)
+            # Try to verify export is available
             try:
-                # Quick check if export is ready (don't wait with full retry)
-                file_url = await vayne_client.check_export_ready(order.vayne_order_id, order.export_format)
-                if file_url:
-                    # Export is ready - mark as completed
-                    new_status = "completed"
-                    if order.status != "completed":
-                        order.status = "completed"
-                        needs_update = True
-                    if not order.completed_at:
-                        order.completed_at = datetime.utcnow()
-                        needs_update = True
-                    print(f"✅ Order {order.id} export verified via sync - marking as completed")
-                else:
-                    # Export not ready yet - keep as processing
-                    print(f"⏳ Order {order.id} export not ready yet via sync. Keeping status as processing.")
-                    new_status = "processing"
-                    if order.status != "processing":
-                        order.status = "processing"
-                        needs_update = True
+                # Attempt to export (this will fail if export isn't ready)
+                await vayne_client.export_order(order.vayne_order_id, order.export_format)
+                # Export succeeded - mark as completed
+                new_status = "completed"
+                if order.status != "completed":
+                    order.status = "completed"
+                    needs_update = True
+                if not order.completed_at:
+                    order.completed_at = datetime.utcnow()
+                    needs_update = True
+                print(f"✅ Order {order.id} export verified via sync - marking as completed")
             except Exception as export_error:
-                # Export check failed - keep as processing
-                print(f"⏳ Order {order.id} export check failed via sync: {export_error}. Keeping status as processing.")
+                # Export not ready yet - keep as processing
+                print(f"⏳ Order {order.id} export not ready yet via sync: {export_error}. Keeping status as processing.")
                 new_status = "processing"
                 if order.status != "processing":
                     order.status = "processing"
@@ -465,11 +439,11 @@ async def get_order(
             # Get scraping_status directly from Vayne API
             scraping_status = vayne_order.get("scraping_status", "initialization")
             
-            # Map Vayne statuses to our DB schema values: pending, processing, completed, failed
+            # Map Vayne statuses to our status values
             status_mapping = {
-                "initialization": "pending",
-                "scraping": "processing",
-                "finished": "completed",
+                "initialization": "initializing",
+                "scraping": "scraping",
+                "finished": "finished",
                 "failed": "failed"
             }
             mapped_status = status_mapping.get(scraping_status, "pending")
@@ -483,7 +457,7 @@ async def get_order(
                 order.status = mapped_status
                 order.progress_percentage = vayne_progress
                 order.leads_found = vayne_leads_found
-                if mapped_status == "completed" and not order.completed_at:
+                if mapped_status == "finished" and not order.completed_at:
                     order.completed_at = datetime.utcnow()
                 db.commit()
         except Exception as e:
@@ -564,20 +538,13 @@ async def export_order(
     if order.csv_file_path:
         return {"status": "success", "message": "CSV already exported", "csv_file_path": order.csv_file_path}
     
-    # Export CSV from Vayne with retry logic (always use advanced format per specification)
+    # Export CSV from Vayne (always use advanced format per specification)
     try:
-        # Use retry-based export to wait for export to be ready
-        csv_data = await vayne_client.export_order_with_retry(
-            order.vayne_order_id, 
-            "advanced",
-            max_retries=5,
-            initial_delay=2.0,
-            max_delay=30.0
-        )
+        csv_data = await vayne_client.export_order(order.vayne_order_id, "advanced")
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to export CSV from Vayne: {str(e)}. Export may not be ready yet, please try again in a few seconds."
+            detail=f"Failed to export CSV from Vayne: {str(e)}"
         )
     
     # Store CSV in R2
@@ -762,9 +729,6 @@ async def get_order_history(
 # ============================================
 # WEBHOOK ENDPOINT (Public, no auth required)
 # ============================================
-# Webhook URL to configure in Vayne dashboard:
-# https://www.billionverifier.io/api/webhooks/vayne/orders
-# Alternative: https://www.billionverifier.io/api/v1/vayne/webhook
 
 @router.post("/webhook")
 async def vayne_webhook(
@@ -775,18 +739,10 @@ async def vayne_webhook(
     Webhook endpoint for Vayne API to send order status updates.
     This endpoint is public (no auth required) but validates payload structure.
     Vayne may send nested order structure: { "order": { ... } } or flat structure.
-    
-    Configure webhook URL in Vayne dashboard API Settings:
-    - Primary: https://www.billionverifier.io/api/webhooks/vayne/orders
-    - Alternative: https://www.billionverifier.io/api/v1/vayne/webhook
     """
     try:
-        # Log incoming webhook for debugging
-        print(f"📥 Vayne webhook received at {datetime.utcnow().isoformat()}")
-        
         # Parse request body (may be nested or flat)
         payload = await request.json()
-        print(f"📥 Webhook payload: {payload}")
         
         # Handle nested structure: { "order": { "id": 123, ... } }
         if "order" in payload:
@@ -800,8 +756,6 @@ async def vayne_webhook(
         if not order_id:
             print(f"⚠️ Webhook received without order ID: {payload}")
             return {"status": "ok", "message": "No order ID provided (ignored)"}
-        
-        print(f"📥 Processing webhook for Vayne order ID: {order_id}")
         
         # Find order by Vayne's order_id
         order = db.query(VayneOrder).filter(
@@ -827,20 +781,15 @@ async def vayne_webhook(
         if scraping_status == "finished" and order.vayne_order_id:
             try:
                 vayne_client = get_vayne_client()
-                # Quick check if export is ready (don't wait with full retry in webhook)
-                file_url = await vayne_client.check_export_ready(order.vayne_order_id, order.export_format)
-                if file_url:
-                    # Export is ready - mark as completed
-                    new_status = "completed"
-                    order.completed_at = datetime.utcnow()
-                    print(f"✅ Order {order_id} (Vayne ID: {order.vayne_order_id}) export verified via webhook - marking as completed")
-                else:
-                    # Export not ready yet - keep as processing, will be updated on next poll
-                    print(f"⏳ Order {order_id} (Vayne ID: {order.vayne_order_id}) export not ready yet via webhook. Keeping status as processing.")
-                    new_status = "processing"
+                # Try to export (this will fail if export isn't ready)
+                await vayne_client.export_order(order.vayne_order_id, order.export_format)
+                # Export succeeded - mark as completed
+                new_status = "completed"
+                order.completed_at = datetime.utcnow()
+                print(f"✅ Order {order_id} (Vayne ID: {order.vayne_order_id}) export verified via webhook - marking as completed")
             except Exception as export_error:
-                # Export check failed - keep as processing
-                print(f"⏳ Order {order_id} (Vayne ID: {order.vayne_order_id}) export check failed via webhook: {export_error}. Keeping status as processing.")
+                # Export not ready yet - keep as processing
+                print(f"⏳ Order {order_id} (Vayne ID: {order.vayne_order_id}) export not ready yet via webhook: {export_error}. Keeping status as processing.")
                 new_status = "processing"
         
         order.status = new_status
@@ -882,208 +831,4 @@ async def vayne_webhook(
         db.rollback()
         # Still return 200 to prevent Vayne from retrying
         return {"status": "error", "message": str(e)}
-
-
-# ============================================
-# ADMIN ENDPOINTS (For monitoring and troubleshooting)
-# ============================================
-
-@router.get("/admin/stuck-orders")
-async def get_stuck_orders(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Get orders that may be stuck (pending/processing for too long).
-    Only admins can access this endpoint.
-    """
-    # Check if user is admin
-    is_admin = current_user.email == ADMIN_EMAIL or getattr(current_user, 'is_admin', False)
-    if not is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
-    
-    # Find orders that are stuck (pending/processing for more than STUCK_ORDER_THRESHOLD_HOURS)
-    threshold_time = datetime.utcnow() - timedelta(hours=STUCK_ORDER_THRESHOLD_HOURS)
-    
-    stuck_orders = db.query(VayneOrder).filter(
-        VayneOrder.status.in_(["pending", "processing"]),
-        VayneOrder.created_at < threshold_time
-    ).order_by(desc(VayneOrder.created_at)).all()
-    
-    return {
-        "stuck_orders": [
-            {
-                "id": str(order.id),
-                "vayne_order_id": order.vayne_order_id,
-                "status": order.status,
-                "progress_percentage": order.progress_percentage,
-                "leads_found": order.leads_found,
-                "created_at": order.created_at.isoformat(),
-                "hours_stuck": round((datetime.utcnow() - order.created_at).total_seconds() / 3600, 1),
-                "sales_nav_url": order.sales_nav_url[:100] + "..." if len(order.sales_nav_url) > 100 else order.sales_nav_url
-            }
-            for order in stuck_orders
-        ],
-        "total": len(stuck_orders),
-        "threshold_hours": STUCK_ORDER_THRESHOLD_HOURS
-    }
-
-
-@router.post("/admin/sync-order/{order_id}")
-async def admin_sync_order(
-    order_id: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Manually sync an order with Vayne API and attempt export if finished.
-    Only admins can access this endpoint.
-    """
-    # Check if user is admin
-    is_admin = current_user.email == ADMIN_EMAIL or getattr(current_user, 'is_admin', False)
-    if not is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
-    
-    try:
-        order_uuid = UUID(order_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid order ID format"
-        )
-    
-    order = db.query(VayneOrder).filter(VayneOrder.id == order_uuid).first()
-    
-    if not order:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found"
-        )
-    
-    if not order.vayne_order_id:
-        return {
-            "status": "error",
-            "message": "Order has no Vayne order ID - cannot sync"
-        }
-    
-    # Sync with Vayne API
-    try:
-        vayne_client = get_vayne_client()
-        vayne_order = await vayne_client.get_order(order.vayne_order_id)
-        
-        scraping_status = vayne_order.get("scraping_status", "initialization")
-        old_status = order.status
-        
-        # Update order fields
-        order.progress_percentage = vayne_order.get("progress_percentage", order.progress_percentage)
-        order.leads_found = vayne_order.get("leads_found", order.leads_found)
-        
-        # If finished, try to export
-        if scraping_status == "finished":
-            try:
-                file_url = await vayne_client.check_export_ready(order.vayne_order_id, order.export_format)
-                if file_url:
-                    order.status = "completed"
-                    if not order.completed_at:
-                        order.completed_at = datetime.utcnow()
-                    
-                    # Try to download and store CSV
-                    if not order.csv_file_path:
-                        try:
-                            csv_data = await vayne_client.export_order_with_retry(order.vayne_order_id, "advanced")
-                            csv_file_path = f"vayne-orders/{order.id}/export.csv"
-                            s3_client.put_object(
-                                Bucket=settings.CLOUDFLARE_R2_BUCKET_NAME,
-                                Key=csv_file_path,
-                                Body=csv_data,
-                                ContentType="text/csv"
-                            )
-                            order.csv_file_path = csv_file_path
-                            logger.info(f"✅ Stored CSV for order {order.id} via admin sync")
-                        except Exception as export_error:
-                            logger.warning(f"⚠️ Failed to store CSV for order {order.id}: {export_error}")
-                else:
-                    order.status = "processing"
-            except Exception as export_error:
-                order.status = "processing"
-                logger.warning(f"⚠️ Export check failed for order {order.id}: {export_error}")
-        elif scraping_status == "failed":
-            order.status = "failed"
-        elif scraping_status == "scraping":
-            order.status = "processing"
-        
-        db.commit()
-        db.refresh(order)
-        
-        return {
-            "status": "success",
-            "message": f"Order synced: {old_status} -> {order.status}",
-            "order": {
-                "id": str(order.id),
-                "status": order.status,
-                "scraping_status": scraping_status,
-                "progress_percentage": order.progress_percentage,
-                "leads_found": order.leads_found,
-                "csv_file_path": order.csv_file_path
-            }
-        }
-    except Exception as e:
-        logger.error(f"❌ Failed to sync order {order_id}: {e}")
-        return {
-            "status": "error",
-            "message": f"Sync failed: {str(e)}"
-        }
-
-
-@router.post("/admin/mark-failed/{order_id}")
-async def admin_mark_order_failed(
-    order_id: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Manually mark an order as failed (for stuck orders that cannot be recovered).
-    Only admins can access this endpoint.
-    """
-    # Check if user is admin
-    is_admin = current_user.email == ADMIN_EMAIL or getattr(current_user, 'is_admin', False)
-    if not is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
-    
-    try:
-        order_uuid = UUID(order_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid order ID format"
-        )
-    
-    order = db.query(VayneOrder).filter(VayneOrder.id == order_uuid).first()
-    
-    if not order:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found"
-        )
-    
-    old_status = order.status
-    order.status = "failed"
-    db.commit()
-    
-    logger.warning(f"⚠️ Order {order_id} manually marked as failed by admin {current_user.email}")
-    
-    return {
-        "status": "success",
-        "message": f"Order marked as failed: {old_status} -> failed",
-        "order_id": str(order.id)
-    }
 
